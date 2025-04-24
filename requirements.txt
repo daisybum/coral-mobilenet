@@ -1,0 +1,8 @@
+# TensorFlow (GPU 지원)
+tensorflow==2.15.0
+
+# YAML 설정 파일 파싱
+PyYAML>=6.0
+
+# HDF5 형태 모델 저장·불러오기를 위한 라이브러리
+h5py>=3.1.0

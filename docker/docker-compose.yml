@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  mnv3_train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # CPU 전용 학습 시 주석 해제:
+        # BASE: "python:3.10-slim"
+        # GPU 사용 시 아래 주석 해제:
+        BASE: "nvidia/cuda:12.4.1-runtime-ubuntu22.04"
+    image: mnv3-trainer:latest
+
+    # NVIDIA GPU 지원 설정
+    runtime: nvidia
+    environment:
+      PYTHONUNBUFFERED: '1'
+      TZ: Asia/Seoul
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+
+    volumes:
+      - ../:/workspace        # 코드·설정
+      - /home/shpark/weather_detection_dataset:/workspace/dataset
+
+    # 기본 CMD(tail -f /dev/null) 대신 다른 스크립트 실행 시:
+    # command: /bin/sh -c "python train.py && tail -f /dev/null"
+
+    tty: true
+    stdin_open: true
