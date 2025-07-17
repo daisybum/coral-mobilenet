@@ -22,7 +22,7 @@ services:
 
     volumes:
       - ../:/workspace        # 코드·설정
-      - /home/shpark/weather_detection_dataset:/workspace/dataset
+      - /home/shpark/weather_detection_dataset/dataset:/workspace/dataset
 
     # 기본 CMD(tail -f /dev/null) 대신 다른 스크립트 실행 시:
     # command: /bin/sh -c "python train.py && tail -f /dev/null"
