@@ -175,3 +175,9 @@ cython_debug/
 
 #
 models/*
+# Machine learning model artifacts
+*.keras
+*model_saved/
+*.h5
+*.tflite
+best_model_saved/

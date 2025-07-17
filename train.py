@@ -1,142 +1,118 @@
 #!/usr/bin/env python3
 """
-MobileNetV3-Large 7-클래스 분류 학습 스크립트
+MobileNetV3-Large (minimalistic) – EdgeTPU 학습 스크립트 v2
+* 이중 스케일 문제 제거
+* 클래스 불균형 대응 (class_weight)
+* Dropout + CosineDecayLR 적용
 """
-
-import yaml
+import os, yaml, collections
+from pathlib import Path
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, callbacks
-from pathlib import Path
 
-# ──── 1. 설정 로드 ───────────────────────────────────────────────
-CONFIG_PATH = "config.yaml"
-cfg = yaml.safe_load(open(CONFIG_PATH, "r"))
+# ── 0. 설정 ─────────────────────────────────────────────
+CFG = yaml.safe_load(open("config.yaml"))
+IMG = (CFG["img_height"], CFG["img_width"])
+BATCH = CFG["batch_size"]; SEED = CFG["seed"]
+VAL_RATE = CFG["valtest_split"]; DATA = Path(CFG["data_dir"])
+E_HEAD, E_FINE = CFG["epochs_head"], CFG["epochs_fine"]
+LR_HEAD, LR_FINE = CFG["initial_lr"], CFG["fine_tune_lr"]
+UNFREEZE_AT = CFG["unfreeze_from"]; ALPHA = CFG["depth_multiplier"]
 
-IMG_SIZE      = (cfg["img_height"], cfg["img_width"])
-BATCH_SIZE    = cfg["batch_size"]
-EPOCHS_HEAD   = cfg["epochs_head"]
-EPOCHS_FINE   = cfg["epochs_fine"]
-INITIAL_LR    = cfg["initial_lr"]
-FINE_TUNE_LR  = cfg["fine_tune_lr"]
-DATA_DIR      = Path(cfg["data_dir"])
-UNFREEZE_FROM = cfg["unfreeze_from"]
+tf.keras.utils.set_random_seed(SEED)
 
-# ──── 2. 데이터 로딩 & 내부 분할 ──────────────────────────────────
-SEED         = 1337
-VALTEST_RATE = 0.30          # train: 70%, 나머지 30%를 val+test로
-
-# 1) train vs (val+test) 1차 분할
+# ── 1. 데이터셋 ────────────────────────────────────────
 train_ds = keras.utils.image_dataset_from_directory(
-    DATA_DIR,                     # dataset/hazy, dataset/normal, …
-    label_mode="categorical",
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    validation_split=VALTEST_RATE,
-    subset="training",
-    seed=SEED,
-    shuffle=True,
-)
+    DATA, label_mode="int", image_size=IMG, batch_size=BATCH,
+    validation_split=VAL_RATE, subset="training", seed=SEED)
 valtest_ds = keras.utils.image_dataset_from_directory(
-    DATA_DIR,
-    label_mode="categorical",
-    image_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    validation_split=VALTEST_RATE,
-    subset="validation",
-    seed=SEED,
-    shuffle=True,                 # 섞어서 가져온 뒤 아래에서 두 등분
+    DATA, label_mode="int", image_size=IMG, batch_size=BATCH,
+    validation_split=VAL_RATE, subset="validation", seed=SEED)
+val_cnt = tf.data.experimental.cardinality(valtest_ds).numpy() // 2
+val_ds  = valtest_ds.take(val_cnt); test_ds = valtest_ds.skip(val_cnt)
+
+CLASSES = train_ds.class_names; N = len(CLASSES)
+print("클래스:", CLASSES)
+
+# ── 1-b. 클래스 가중치 계산 ────────────────────────────
+label_counts = collections.Counter()
+for _, y in train_ds.unbatch(): label_counts[int(y)] += 1
+total = sum(label_counts.values())
+class_weight = {i: total/(N*cnt) for i, cnt in label_counts.items()}
+print("클래스 가중치:", class_weight)
+
+# ── 2. 증강 (Rescaling 제거!) ──────────────────────────
+augment = keras.Sequential([
+    layers.RandomFlip("horizontal"),
+    layers.RandomRotation(0.05),
+    layers.RandomZoom(0.1),
+])
+
+prep = keras.applications.mobilenet_v3.preprocess_input
+
+def preprocess(x, y):
+    x = augment(x, training=True)
+    x = prep(x)          # 입력을 [-1,1] 로 스케일 (단일 단계)
+    return x, y
+
+train_ds = train_ds.map(preprocess).cache().prefetch(tf.data.AUTOTUNE)
+val_ds   = val_ds.map(lambda x,y:(prep(x),y)).cache().prefetch(tf.data.AUTOTUNE)
+test_ds  = test_ds.map(lambda x,y:(prep(x),y)).cache().prefetch(tf.data.AUTOTUNE)
+
+# ── 3. 모델 ────────────────────────────────────────────
+base = keras.applications.MobileNetV3Large(
+    input_shape=IMG+(3,), include_top=False, minimalistic=True,
+    alpha=ALPHA, weights="imagenet")
+base.trainable = False
+
+inputs = keras.Input(shape=IMG+(3,))
+x = base(inputs, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.Dropout(0.3)(x)              # 규제 추가
+outputs = layers.Dense(N, activation="softmax")(x)
+model = keras.Model(inputs, outputs)
+
+# ── 4. 콜백 & 학습 스케줄 ──────────────────────────────
+schedule_h = keras.optimizers.schedules.CosineDecay(
+    initial_learning_rate=LR_HEAD, decay_steps=len(train_ds)*E_HEAD)
+schedule_f = keras.optimizers.schedules.CosineDecay(
+    initial_learning_rate=LR_FINE, decay_steps=len(train_ds)*E_FINE)
+
+ckpt = callbacks.ModelCheckpoint(
+    "best.keras",             # ← 최고 가중치 (weights-only)
+    monitor="val_accuracy",
+    save_best_only=True,
+    save_weights_only=True,
+    verbose=1
 )
+es   = callbacks.EarlyStopping(monitor="val_accuracy", patience=6, restore_best_weights=True)
 
-# 2) (val+test) → val / test 2차 분할 (동일 비율: 15 %씩)
-valtest_count = tf.data.experimental.cardinality(valtest_ds).numpy()
-val_ds  = valtest_ds.take(valtest_count // 2)
-test_ds = valtest_ds.skip(valtest_count // 2)
+# ── 5-1. 헤드 학습 ────────────────────────────────────
+model.compile(optimizer=keras.optimizers.Adam(schedule_h),
+              loss=keras.losses.SparseCategoricalCrossentropy(),
+              metrics=["accuracy"])
+model.fit(train_ds, validation_data=val_ds, epochs=E_HEAD,
+          class_weight=class_weight, callbacks=[ckpt, es])
 
-class_names = train_ds.class_names
-NUM_CLASSES = len(class_names)
+# ── 5-2. 미세조정 ─────────────────────────────────────
+base.trainable = True
+for l in base.layers[:UNFREEZE_AT]:
+    l.trainable = False
 
-AUTOTUNE = tf.data.AUTOTUNE
-train_ds = train_ds.prefetch(AUTOTUNE)
-val_ds   = val_ds.prefetch(AUTOTUNE)
-test_ds  = test_ds.prefetch(AUTOTUNE)
+model.compile(optimizer=keras.optimizers.Adam(schedule_f),
+              loss=keras.losses.SparseCategoricalCrossentropy(),
+              metrics=["accuracy"])
+model.fit(train_ds, validation_data=val_ds, epochs=E_FINE,
+          class_weight=class_weight, callbacks=[ckpt, es])
 
-# ──── 3. 전처리·증강 ─────────────────────────────────────────────
-augment = keras.Sequential(
-    [
-        layers.RandomFlip("horizontal"),
-        layers.RandomRotation(0.05),
-        layers.RandomZoom(0.1),
-    ],
-    name="augmentation",
-)
+print("테스트 성능:")
+model.evaluate(test_ds)
 
-# ──── 4. 모델 정의 ──────────────────────────────────────────────
-base_model = keras.applications.MobileNetV3Large(
-    input_shape=IMG_SIZE + (3,),
-    include_top=False,
-    weights="imagenet",
-    dropout_rate=0.2,
-    include_preprocessing=True,
-)
-base_model.trainable = False  # 1단계: 헤드만 학습
+model.save("saved_model_edgetpu")
 
-inputs  = keras.Input(shape=IMG_SIZE + (3,))
-x       = augment(inputs)
-x       = base_model(x, training=False)
-x       = layers.GlobalAveragePooling2D()(x)
-x       = layers.Dropout(0.2)(x)
-outputs = layers.Dense(NUM_CLASSES, activation="softmax")(x)
-model   = keras.Model(inputs, outputs, name="mnv3large_weather")
-
-# ──── 5. 콜백 ───────────────────────────────────────────────────
-ckpt_cb   = callbacks.ModelCheckpoint("best_model.h5", save_best_only=True,
-                                     monitor="val_accuracy", mode="max")
-early_cb  = callbacks.EarlyStopping(patience=5, restore_best_weights=True,
-                                    monitor="val_accuracy", mode="max")
-reduce_cb = callbacks.ReduceLROnPlateau(factor=0.2, patience=3,
-                                        monitor="val_loss", mode="min")
-
-# ──── 6. 1단계 학습 ─────────────────────────────────────────────
-model.compile(
-    optimizer=keras.optimizers.Adam(INITIAL_LR),
-    loss="categorical_crossentropy",
-    metrics=["accuracy"],
-)
-model.fit(
-    train_ds,
-    epochs=EPOCHS_HEAD,
-    validation_data=val_ds,
-    callbacks=[ckpt_cb, early_cb, reduce_cb],
-)
-
-# ──── 7. 2단계 미세조정 ────────────────────────────────────────
-base_model.trainable = True
-for layer in base_model.layers[:UNFREEZE_FROM]:
-    layer.trainable = False
-
-model.compile(
-    optimizer=keras.optimizers.Adam(FINE_TUNE_LR),
-    loss="categorical_crossentropy",
-    metrics=["accuracy"],
-)
-model.fit(
-    train_ds,
-    epochs=EPOCHS_HEAD + EPOCHS_FINE,
-    initial_epoch=model.history.epoch[-1] + 1,
-    validation_data=val_ds,
-    callbacks=[ckpt_cb, early_cb, reduce_cb],
-)
-
-# ──── 8. 테스트(optional) ──────────────────────────────────────
-test_dir = DATA_DIR / "test"
-if test_dir.exists():
-    test_ds = keras.utils.image_dataset_from_directory(
-        test_dir,
-        label_mode="categorical",
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-    ).prefetch(AUTOTUNE)
-    loss, acc = model.evaluate(test_ds)
-    print(f"\n✅ 테스트 정확도: {acc:.4f}")
+# ── 6. 최고 모델 저장 ─────────────────────────────────
+# best.keras → 모델 구조에 주입 후 SavedModel 로 보관
+model.load_weights("best.keras")          # 최고 성능 가중치 불러오기
+model.save("best_model_saved")            # 완전한 SavedModel 디렉터리
+print("✔️  최고 성능 모델 SavedModel 로 저장: best_model_saved/")
